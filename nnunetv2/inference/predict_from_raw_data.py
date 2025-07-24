@@ -264,8 +264,9 @@ class nnUNetPredictor(object):
                                                                                  seg_from_prev_stage_files,
                                                                                  output_filename_truncated,
                                                                                  num_processes_preprocessing)
-
-        return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
+        
+        return data_iterator
+        # return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
 
     def _internal_get_data_iterator_from_lists_of_filenames(self,
                                                             input_list_of_lists: List[List[str]],
@@ -467,7 +468,7 @@ class nnUNetPredictor(object):
             else:
                 return ret
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
         """
         IMPORTANT! IF YOU ARE RUNNING THE CASCADE, THE SEGMENTATION FROM THE PREVIOUS STAGE MUST ALREADY BE STACKED ON
@@ -492,16 +493,20 @@ class nnUNetPredictor(object):
             # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
             # this actually saves computation time
             if prediction is None:
-                prediction = self.predict_sliding_window_return_logits(data).to('cpu')
+                tmp_ret = self.predict_sliding_window_return_logits(data)
+                prediction = tmp_ret[0].to('cpu')
+                cam_accumulator = tmp_ret[1].to('cpu')
             else:
-                prediction += self.predict_sliding_window_return_logits(data).to('cpu')
+                tmp_ret = self.predict_sliding_window_return_logits(data)
+                prediction += tmp_ret[0].to('cpu')
+                cam_accumulator += tmp_ret[1].to('cpu')
 
         if len(self.list_of_parameters) > 1:
             prediction /= len(self.list_of_parameters)
 
         if self.verbose: print('Prediction done')
         torch.set_num_threads(n_threads)
-        return prediction
+        return prediction, cam_accumulator
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
         slicers = []
@@ -537,7 +542,7 @@ class nnUNetPredictor(object):
                                                   zip((sx, sy, sz), self.configuration_manager.patch_size)]]))
         return slicers
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
         prediction = self.network(x)
@@ -552,11 +557,11 @@ class nnUNetPredictor(object):
                 c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
             ]
             for axes in axes_combinations:
-                prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
+                prediction = prediction + torch.flip(self.network(torch.flip(x, axes)), axes)
             prediction /= (len(axes_combinations) + 1)
         return prediction
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def _internal_predict_sliding_window_return_logits(self,
                                                        data: torch.Tensor,
                                                        slicers,
@@ -564,6 +569,22 @@ class nnUNetPredictor(object):
                                                        ):
         predicted_logits = n_predictions = prediction = gaussian = workon = None
         results_device = self.device if do_on_device else torch.device('cpu')
+
+        # ---- Grad-CAM accumulators ----
+        cam_accumulator = None
+        self.activations = None
+        self.gradients = None
+
+        # Hooks for Grad-CAM
+        def forward_hook(module, inp, out):
+            self.activations = out
+
+        def backward_hook(module, grad_inp, grad_out):
+            self.gradients = grad_out[0]
+
+        # Register hooks on bottleneck layer
+        self.network.decoder.seg_layers[-1].register_forward_hook(forward_hook)
+        self.network.decoder.seg_layers[-1].register_full_backward_hook(backward_hook)
 
         def producer(d, slh, q):
             for s in slh:
@@ -588,6 +609,7 @@ class nnUNetPredictor(object):
                                            dtype=torch.half,
                                            device=results_device)
             n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
+            cam_accumulator = torch.zeros((1, *data.shape[1:]), dtype=torch.float32, device=results_device)
 
             if self.use_gaussian:
                 gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
@@ -610,6 +632,45 @@ class nnUNetPredictor(object):
 
                     if self.use_gaussian:
                         prediction *= gaussian
+                    
+                    # ---- Compute Grad-CAM for this patch ----
+                    probs = torch.softmax(prediction, dim=1)
+
+                    # Select class and create mask
+                    class_idx = 1  # Example: cartilage class
+                    pred_mask = torch.argmax(probs, dim=0, keepdim=True)
+                    probs = probs.float()
+
+                    # Define Grad-CAM objective: sum of probs in masked region
+                    score = (prediction[class_idx] * pred_mask).mean()
+
+                    # Backward pass
+                    self.network.zero_grad()
+                    score.backward()
+
+                    # Compute Grad-CAM
+                    grads = self.gradients.mean(dim=(2, 3), keepdim=True)
+                    cam = torch.sum(self.activations * grads, dim=1, keepdim=True)
+                    
+                    cam = torch.relu(cam)
+                    cam = cam / (1e-7 + cam.max())
+
+                    # Resize CAM to patch size
+                    cam_resized = torch.nn.functional.interpolate(cam,
+                        size=workon.shape[2:], mode='bilinear', align_corners=False)
+
+                    cam_resized = cam_resized[0]
+                    if self.use_gaussian:
+                        cam_resized *= gaussian
+
+                    # Aggregate CAM
+                    cam_accumulator[sl] += cam_resized
+
+                    # Garbage collection
+                    self.activations = None
+                    self.gradients = None
+                    # -------------------------------------------
+                    
                     predicted_logits[sl] += prediction
                     n_predictions[sl[1:]] += gaussian
                     queue.task_done()
@@ -617,7 +678,11 @@ class nnUNetPredictor(object):
             queue.join()
 
             # predicted_logits /= n_predictions
+            predicted_logits = predicted_logits.detach()
+            n_predictions = n_predictions.detach()
+            cam_accumulator = cam_accumulator.detach()
             torch.div(predicted_logits, n_predictions, out=predicted_logits)
+            torch.div(cam_accumulator, n_predictions, out=cam_accumulator)
             # check for infs
             if torch.any(torch.isinf(predicted_logits)):
                 raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
@@ -628,9 +693,9 @@ class nnUNetPredictor(object):
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
-        return predicted_logits
+        return predicted_logits, cam_accumulator
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
             -> Union[np.ndarray, torch.Tensor]:
         assert isinstance(input_image, torch.Tensor)
@@ -663,21 +728,22 @@ class nnUNetPredictor(object):
             if self.perform_everything_on_device and self.device != 'cpu':
                 # we need to try except here because we can run OOM in which case we need to fall back to CPU as a results device
                 try:
-                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                    predicted_logits, cam_accumulator = self._internal_predict_sliding_window_return_logits(data, slicers,
                                                                                            self.perform_everything_on_device)
                 except RuntimeError:
                     print(
                         'Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
                     empty_cache(self.device)
-                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+                    predicted_logits, cam_accumulator = self._internal_predict_sliding_window_return_logits(data, slicers, False)
             else:
-                predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                predicted_logits, cam_accumulator = self._internal_predict_sliding_window_return_logits(data, slicers,
                                                                                        self.perform_everything_on_device)
 
             empty_cache(self.device)
             # revert padding
             predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
-        return predicted_logits
+            cam_accumulator = cam_accumulator[(slice(None), *slicer_revert_padding[1:])]
+        return predicted_logits, cam_accumulator
 
     def predict_from_files_sequential(self,
                            list_of_lists_or_source_folder: Union[str, List[List[str]]],
@@ -749,7 +815,7 @@ class nnUNetPredictor(object):
 
             print(f'perform_everything_on_device: {self.perform_everything_on_device}')
 
-            prediction = self.predict_logits_from_preprocessed_data(torch.from_numpy(data)).cpu()
+            prediction, cam_accumulator = self.predict_logits_from_preprocessed_data(torch.from_numpy(data)).cpu()
 
             if of is not None:
                 export_prediction_from_logits(prediction, data_properties, self.configuration_manager, self.plans_manager,
