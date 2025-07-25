@@ -630,19 +630,15 @@ class nnUNetPredictor(object):
                     workon, sl = item
                     prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
 
-                    if self.use_gaussian:
-                        prediction *= gaussian
-                    
                     # ---- Compute Grad-CAM for this patch ----
                     probs = torch.softmax(prediction, dim=1)
 
                     # Select class and create mask
                     class_idx = 1  # Example: cartilage class
                     pred_mask = torch.argmax(probs, dim=0, keepdim=True)
-                    probs = probs.float()
-
+                    
                     # Define Grad-CAM objective: sum of probs in masked region
-                    score = (prediction[class_idx] * pred_mask).mean()
+                    score = (prediction[class_idx] * pred_mask).sum()
 
                     # Backward pass
                     self.network.zero_grad()
@@ -651,14 +647,13 @@ class nnUNetPredictor(object):
                     # Compute Grad-CAM
                     grads = self.gradients.mean(dim=(2, 3), keepdim=True)
                     cam = torch.sum(self.activations * grads, dim=1, keepdim=True)
-                    
                     cam = torch.relu(cam)
-                    cam = cam / (1e-7 + cam.max())
 
                     # Resize CAM to patch size
                     cam_resized = torch.nn.functional.interpolate(cam,
                         size=workon.shape[2:], mode='bilinear', align_corners=False)
-
+                    
+                    # Gaussian weight CAM for stitching overlapping patches
                     cam_resized = cam_resized[0]
                     if self.use_gaussian:
                         cam_resized *= gaussian
@@ -670,6 +665,9 @@ class nnUNetPredictor(object):
                     self.activations = None
                     self.gradients = None
                     # -------------------------------------------
+
+                    if self.use_gaussian:
+                        prediction *= gaussian
                     
                     predicted_logits[sl] += prediction
                     n_predictions[sl[1:]] += gaussian
