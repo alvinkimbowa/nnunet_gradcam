@@ -583,8 +583,8 @@ class nnUNetPredictor(object):
             self.gradients = grad_out[0]
 
         # Register hooks on bottleneck layer
-        self.network.decoder.seg_layers[-1].register_forward_hook(forward_hook)
-        self.network.decoder.seg_layers[-1].register_full_backward_hook(backward_hook)
+        self.network.decoder.stages[-1].register_forward_hook(forward_hook)
+        self.network.decoder.stages[-1].register_full_backward_hook(backward_hook)
 
         def producer(d, slh, q):
             for s in slh:
