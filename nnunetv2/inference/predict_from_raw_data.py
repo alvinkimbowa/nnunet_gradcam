@@ -634,7 +634,7 @@ class nnUNetPredictor(object):
                     probs = torch.softmax(prediction, dim=1)
 
                     # Select class and create mask
-                    class_idx = 1  # Example: cartilage class
+                    class_idx = 1 # TODO: make this dynamic
                     pred_mask = torch.argmax(probs, dim=0, keepdim=True)
                     
                     # Define Grad-CAM objective: sum of probs in masked region
