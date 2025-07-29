@@ -469,7 +469,7 @@ class nnUNetPredictor(object):
                 return ret
 
     # @torch.inference_mode()
-    def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
+    def predict_logits_from_preprocessed_data(self, data: torch.Tensor, target_layer: int, encoder: bool = False) -> torch.Tensor:
         """
         IMPORTANT! IF YOU ARE RUNNING THE CASCADE, THE SEGMENTATION FROM THE PREVIOUS STAGE MUST ALREADY BE STACKED ON
         TOP OF THE IMAGE AS ONE-HOT REPRESENTATION! SEE PreprocessAdapter ON HOW THIS SHOULD BE DONE!
@@ -480,6 +480,24 @@ class nnUNetPredictor(object):
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
         prediction = None
+
+        self.activations = None
+        self.gradients = None
+
+        # Hooks for Grad-CAM
+        def forward_hook(module, inp, out):
+            self.activations = out
+
+        def backward_hook(module, grad_inp, grad_out):
+            self.gradients = grad_out[0]
+
+        # Register hooks on bottleneck layer
+        if encoder:
+            forward_handle = self.network.encoder.stages[target_layer].register_forward_hook(forward_hook)
+            backward_handle = self.network.encoder.stages[target_layer].register_full_backward_hook(backward_hook)
+        else:
+            forward_handle = self.network.decoder.stages[target_layer].register_forward_hook(forward_hook)
+            backward_handle = self.network.decoder.stages[target_layer].register_full_backward_hook(backward_hook)
 
         for params in self.list_of_parameters:
 
@@ -506,6 +524,10 @@ class nnUNetPredictor(object):
 
         if self.verbose: print('Prediction done')
         torch.set_num_threads(n_threads)
+
+        forward_handle.remove()
+        backward_handle.remove()
+
         return prediction, cam_accumulator
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
@@ -570,21 +592,8 @@ class nnUNetPredictor(object):
         predicted_logits = n_predictions = prediction = gaussian = workon = None
         results_device = self.device if do_on_device else torch.device('cpu')
 
-        # ---- Grad-CAM accumulators ----
+        # ---- Grad-CAM accumulator ----
         cam_accumulator = None
-        self.activations = None
-        self.gradients = None
-
-        # Hooks for Grad-CAM
-        def forward_hook(module, inp, out):
-            self.activations = out
-
-        def backward_hook(module, grad_inp, grad_out):
-            self.gradients = grad_out[0]
-
-        # Register hooks on bottleneck layer
-        self.network.decoder.stages[-1].register_forward_hook(forward_hook)
-        self.network.decoder.stages[-1].register_full_backward_hook(backward_hook)
 
         def producer(d, slh, q):
             for s in slh:
